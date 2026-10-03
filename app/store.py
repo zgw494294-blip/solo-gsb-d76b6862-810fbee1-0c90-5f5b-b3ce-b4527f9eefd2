@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
+from . import reuse
 from .db import connect, lock
 from .solver import Material, solve
 
@@ -437,4 +438,68 @@ def get_archived_curve(draft_id: int) -> dict:
             "id": draft_id,
             "version": row["archived_draft_version"],
             "temperatures": list(result["temperatures"]),
+        }
+
+
+# ---------------- 原曲线复用检查（只读，不重新求解） ----------------
+
+
+def check_archived_reuse(draft_id: int) -> dict:
+    """核验已归档炉次的冻结曲线能否用于各配方的**当前**参数与状态。
+
+    - 炉次不存在 => NotFound（404）；
+    - 炉次存在但未归档（活动草稿 / 无解草稿）=> Unprocessable（422）；
+    - 已归档 => 在同一把锁、同一条连接内读取冻结曲线与全部引用配方的
+      当前参数/状态（同一读取时点），按原引用顺序逐项核验并给出整体
+      可复用结论。纯只读：不改配方、草稿或归档，也不重新求解。
+    """
+    with lock(), connect() as conn:
+        row = conn.execute(_DRAFT_SELECT + " WHERE d.id=?", (draft_id,)).fetchone()
+        if row is None:
+            raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+        if row["archive_id"] is None:
+            raise Unprocessable(
+                "该炉次尚未归档，复用检查只能针对已归档的冻结曲线。"
+            )
+
+        recipe_ids = json.loads(row["recipe_ids"])
+        result = json.loads(row["archived_result_json"])
+        temperatures = list(result["temperatures"])
+
+        # 按原配方引用顺序读取当前参数与状态（引用创建后不可改，配方不会被删除）
+        placeholders = ",".join("?" * len(recipe_ids))
+        rows = conn.execute(
+            f"SELECT * FROM recipes WHERE id IN ({placeholders})", recipe_ids
+        ).fetchall()
+        by_id = {r["id"]: r for r in rows}
+        ordered = [by_id[rid] for rid in recipe_ids]
+
+        items: list[dict] = []
+        for r in ordered:
+            # 停用配方同样完成温度检查；其状态只影响整体可复用结论
+            check = reuse.check_item(temperatures, _to_material(r))
+            items.append(
+                {
+                    "recipeId": r["id"],
+                    "name": _material_snapshot(r)["name"],
+                    "version": r["version"],
+                    "status": r["status"],
+                    **check,
+                }
+            )
+
+        # 全部保温达标、无任何超限且配方均可用时，整体才可复用
+        reusable = all(
+            it["holdOk"]
+            and it["toleranceBreachStep"] is None
+            and it["status"] == "active"
+            for it in items
+        )
+        return {
+            "draftId": draft_id,
+            "version": row["archived_draft_version"],
+            "stepCount": len(temperatures),
+            "temperatures": temperatures,
+            "items": items,
+            "reusable": reusable,
         }

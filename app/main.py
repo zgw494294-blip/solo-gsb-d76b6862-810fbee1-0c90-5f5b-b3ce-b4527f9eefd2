@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="共炉保温编排台", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="共炉保温编排台", version="2.3.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -447,6 +447,18 @@ async def draft_electricity(draft_id: int, request: Request):
 
     result = electricity.estimate(temperatures, start_minute, prices, powers)
     return {"draftId": draft_id, "version": curve["version"], **result}
+
+
+# ---------------- 已归档炉次原曲线复用检查（只读，不重新求解） ----------------
+
+
+@app.post("/api/drafts/{draft_id}/reuse-check")
+def draft_reuse_check(draft_id: int):
+    # 只读核验：未知炉次 404，未归档 422；不重新求解，不改配方/草稿/归档
+    try:
+        return store.check_archived_reuse(draft_id)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
 
 
 @app.get("/healthz")

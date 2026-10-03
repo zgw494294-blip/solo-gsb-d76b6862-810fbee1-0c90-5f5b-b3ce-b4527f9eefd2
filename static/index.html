@@ -178,6 +178,24 @@
         <div id="draft-result-slot"></div>
       </section>
 
+      <!-- 原曲线复用检查：仅已归档炉次显示；只读当前配方，不重新求解 -->
+      <section class="card" id="draft-reuse-card" hidden>
+        <h2>原曲线复用检查 <span class="badge status-archived">只读 · 不求解</span></h2>
+        <p class="executed-hint">
+          按原配方引用顺序读取各配方<b>当前</b>参数与状态，核验本炉次<b>归档冻结</b>的
+          温度曲线是否仍然成立：连续保温沿用原规则（每档 5 分钟，落在保温区间内累计，
+          离开区间未达标进度归零），达标后仍逐档检查全曲线耐受；停用配方同样完成温度
+          检查。全部材料保温达标、无任何超限且配方均可用时才标为可复用。
+          检查不重新求解，也不改动配方、草稿或归档。
+        </p>
+        <p class="form-error" id="reuse-error" hidden></p>
+        <div class="actions">
+          <button type="button" id="reuse-submit-btn">检查原曲线能否复用</button>
+          <span class="hint">结论不保存；切换或刷新详情会立即清除。</span>
+        </div>
+        <div id="reuse-result"></div>
+      </section>
+
       <!-- 电费试算：仅已归档炉次显示；只读冻结曲线，不保存试算、不改动方案 -->
       <section class="card" id="draft-electricity-card" hidden>
         <h2>归档炉次电费试算 <span class="badge status-archived">只读 · 不保存</span></h2>

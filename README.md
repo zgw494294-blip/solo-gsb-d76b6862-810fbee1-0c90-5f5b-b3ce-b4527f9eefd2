@@ -10,10 +10,11 @@
 
 - 后端：Python + FastAPI（求解核心见 `app/solver.py`，纯标准库 BFS；
   配方 / 炉次 / 归档用 SQLite 持久化，见 `app/db.py`、`app/store.py`；
-  已归档炉次只读电费试算见 `app/electricity.py`）
+  已归档炉次只读电费试算见 `app/electricity.py`，原曲线复用只读核验见
+  `app/reuse.py`）
 - 前端：原生 HTML / CSS / JavaScript（`static/`，无任何前端构建与框架，
   页面分为「编排求解 / 材料配方 / 炉次草稿」三个标签页；已归档炉次详情中
-  含电费试算卡片）
+  含原曲线复用检查与电费试算卡片）
 
 ## 一条命令启动
 
@@ -229,6 +230,7 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | POST | `/api/drafts` | 按 2～3 个不同现有配方 ID 创建炉次并从空记录求解（201；引用已停用配方 422） |
 | GET | `/api/drafts/{id}` | 读取炉次详情（归档后返回冻结快照） |
 | POST | `/api/drafts/{id}/archive` | 携带查看版本归档（过期 409 / 无解 422） |
+| POST | `/api/drafts/{id}/reuse-check` | 已归档炉次原曲线复用检查（只读当前配方，不重新求解；未知 404 / 未归档 422） |
 | POST | `/api/drafts/{id}/electricity` | 已归档炉次电费试算（只读冻结曲线，不保存；未知 404 / 未归档或参数非法 422） |
 
 ### 从零编排（可直接复制执行）
@@ -598,17 +600,91 @@ curl -sS -X POST http://localhost:8000/api/drafts/1/electricity \
   等）在错误条显示后端中文原因；网络失败不改动数据并可直接重试——恢复与否
   只取决于当前这一代自身是否结束，**不受旧请求是否已经结束影响**。
 
+### 已归档炉次原曲线复用检查 `POST /api/drafts/{id}/reuse-check`
+
+对已归档炉次回答一个问题：**冻结的原曲线还能不能用于各配方的当前参数**。
+只读核验、不重新求解，也不改动配方、草稿或归档。
+
+- 按炉次创建时的**原配方引用顺序**，在**同一读取时点**读取各配方的当前
+  参数与状态，逐项核验归档冻结曲线；
+- 连续保温沿用原规则：每档 5 分钟，档位温度落在 `[保温下限, 保温上限]`
+  内则连续进度 +1，达到所需档数即达标；离开区间时未达标进度归零，
+  已达标者保持达标；
+- 每项返回：配方 ID、当前 `version` 与 `status`、保温是否达标
+  （`holdOk`）、**首次达标**的连续档位区间 `window`（`startStep` /
+  `endStep`，从 1 计，无则 `null`）、**首次超过耐受上限**的档号
+  `toleranceBreachStep`（从 1 计，无则 `null`）；耐受检查覆盖整条曲线
+  （达标后仍逐档检查）；
+- **停用配方同样完成温度检查**，仅其状态会使整体判为不可复用；
+- 全部材料保温达标、无任何超限且配方均为可用时，`reusable` 才为
+  `true`；
+- 炉次 ID 未知 → **404**；炉次存在但未归档 → **422**。
+
+可直接复制执行（全新实例上依次执行：建配方 → 建炉次 → 归档 → 检查）：
+
+```bash
+# 1) 两个配方 + 一个引用它们的炉次草稿（创建即求解，版本均为 1）
+curl -sS -X POST http://localhost:8000/api/recipes \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"钢甲","holdLow":60,"holdHigh":100,"duration":10,"tolerance":150}'
+curl -sS -X POST http://localhost:8000/api/recipes \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"铜乙","holdLow":80,"holdHigh":120,"duration":5,"tolerance":160}'
+curl -sS -X POST http://localhost:8000/api/drafts \
+  -H 'Content-Type: application/json' -d '{"name":"十月首炉","recipeIds":[1,2]}'
+
+# 2) 归档炉次 1（冻结曲线为 6 档 [40,60,80,60,40,20]）
+curl -sS -X POST http://localhost:8000/api/drafts/1/archive \
+  -H 'Content-Type: application/json' -d '{"version":1}'
+
+# 3) 复用检查：原曲线能否用于各配方的当前参数
+curl -sS -X POST http://localhost:8000/api/drafts/1/reuse-check
+```
+
+第 3 步返回（HTTP 200）：
+
+```json
+{
+  "draftId": 1,
+  "version": 1,
+  "stepCount": 6,
+  "temperatures": [40, 60, 80, 60, 40, 20],
+  "items": [
+    {"recipeId": 1, "name": "钢甲", "version": 1, "status": "active",
+     "holdOk": true, "window": {"startStep": 2, "endStep": 3},
+     "toleranceBreachStep": null},
+    {"recipeId": 2, "name": "铜乙", "version": 1, "status": "active",
+     "holdOk": true, "window": {"startStep": 3, "endStep": 3},
+     "toleranceBreachStep": null}
+  ],
+  "reusable": true
+}
+```
+
+归档后若配方被修改（例如钢甲保温区间改为 90～100°C，曲线最高仅 80°C），
+同一接口会给出逐项结论：`钢甲` 变为 `holdOk:false, window:null`，
+整体 `reusable:false`；若某配方耐受上限被调低，则
+`toleranceBreachStep` 给出首次超限档号（1 计）；配方被停用时该项温度
+检查照常完成，但 `status:"disabled"` 使整体不可复用。
+
+前端在「炉次草稿」的已归档详情中显示「原曲线复用检查」卡片：点击后逐项
+展示配方 ID、当前版本与状态、保温是否达标、首次达标区间与首次超限档号，
+并给出整体可复用结论。**切换炉次或刷新详情会立即清除结论**；检查请求自带
+代际，旧响应（成功 / HTTP 错误 / 网络异常）一律作废，不会回填到当前界面，
+等待期间按钮禁用、不重复提交。
+
 ## 目录结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / 电费试算）
+│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / 复用检查 / 电费试算）
 │   ├── solver.py      # 规则常量、校验与 BFS 求解（配方与草稿复用）
+│   ├── reuse.py       # 已归档炉次原曲线复用检查（只读核验，不重新求解）
 │   ├── electricity.py # 已归档炉次电费试算（跨小时/午夜分摊、逐档与总费用舍入）
 │   ├── db.py          # SQLite 连接、建表与全局串行锁
-│   └── store.py       # 配方 / 炉次草稿 / 归档 / 归档曲线只读 的事务化读写
+│   └── store.py       # 配方 / 炉次草稿 / 归档 / 归档曲线只读 / 复用检查 的事务化读写
 ├── static/
 │   ├── index.html     # 页面（编排求解 / 材料配方 / 炉次草稿 三个标签页）
 │   ├── styles.css     # 样式
