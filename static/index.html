@@ -206,6 +206,24 @@
         </form>
         <div id="elec-result"></div>
       </section>
+
+      <!-- 原曲线复用检查：仅已归档炉次显示；只读，不重新求解、不改任何数据 -->
+      <section class="card" id="draft-reuse-card" hidden>
+        <h2>原曲线复用检查 <span class="badge status-archived">只读 · 不重新求解</span></h2>
+        <p class="executed-hint">
+          用本炉次<b>归档冻结的原曲线</b>（每档 5 分钟），按原配方引用顺序读取各配方的
+          <b>当前参数、版本与状态</b>，逐项核对：保温是否按原连续保温规则首次达标、
+          达标后是否仍有档位超过当前耐受上限。停用的配方也会完成温度检查。
+          仅当全部材料保温达标、无超限且配方均处于「可用」状态时，原曲线才标为可复用。
+          检查不修改配方、草稿或归档。
+        </p>
+        <div class="actions">
+          <button type="button" id="reuse-check-btn">检查原曲线能否复用</button>
+          <span class="hint">切换炉次或刷新详情会清除既有结论。</span>
+        </div>
+        <p class="form-error" id="reuse-error" hidden></p>
+        <div id="reuse-result"></div>
+      </section>
     </section>
   </main>
 

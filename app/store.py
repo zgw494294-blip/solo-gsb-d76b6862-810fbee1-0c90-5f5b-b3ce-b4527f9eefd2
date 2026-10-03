@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .db import connect, lock
-from .solver import Material, solve
+from .solver import Material, evaluate_curve, solve
 
 
 # ---------------- 异常（路由层映射为 HTTP 状态码） ----------------
@@ -63,6 +63,19 @@ def _tx(conn):
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+@contextmanager
+def _snapshot(conn):
+    """只读快照事务：一次检查内的全部 SELECT 取同一时点。
+
+    WAL 下延迟事务在首次读时建立快照；结束时回滚，绝不产生任何写入。
+    """
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        conn.execute("ROLLBACK")
 
 
 def _recipe_dict(row) -> dict:
@@ -438,3 +451,78 @@ def get_archived_curve(draft_id: int) -> dict:
             "version": row["archived_draft_version"],
             "temperatures": list(result["temperatures"]),
         }
+
+
+# ---------------- 原曲线复用检查（只读，不重新求解） ----------------
+
+
+def reuse_check(draft_id: int) -> dict:
+    """用已归档炉次冻结的原曲线，逐项核对当前配方参数能否直接复用。
+
+    - 炉次不存在 => NotFound（404）；
+    - 炉次存在但未归档 => Unprocessable（422）；
+    - 已归档 => 按原配方引用顺序，在**同一只读快照时点**读取各配方的当前
+      参数 / 版本 / 状态，逐项做保温与全曲线耐受检查。整次检查只读，
+      不改配方、草稿或归档。
+    """
+    with lock(), connect() as conn:
+        with _snapshot(conn):
+            row = conn.execute(
+                _DRAFT_SELECT + " WHERE d.id=?", (draft_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+            if row["archive_id"] is None:
+                raise Unprocessable(
+                    "该炉次尚未归档，原曲线复用检查只能针对已归档的冻结曲线。"
+                )
+
+            recipe_ids: list[int] = json.loads(row["recipe_ids"])
+            placeholders = ",".join("?" * len(recipe_ids))
+            rows = conn.execute(
+                f"SELECT * FROM recipes WHERE id IN ({placeholders})", recipe_ids
+            ).fetchall()
+            by_id = {r["id"]: r for r in rows}
+            ordered = [by_id[rid] for rid in recipe_ids]
+
+            materials = [_to_material(r) for r in ordered]
+            temperatures = list(json.loads(row["archived_result_json"])["temperatures"])
+            outcomes = evaluate_curve(temperatures, materials)
+
+            items: list[dict] = []
+            for rid, recipe_row, outcome in zip(recipe_ids, ordered, outcomes):
+                status = recipe_row["status"]
+                breach = outcome["firstToleranceBreachStep"]
+                reusable = bool(
+                    status == "active"
+                    and outcome["holdMet"]
+                    and breach is None
+                )
+                items.append(
+                    {
+                        "recipeId": rid,
+                        "name": recipe_row["name"],
+                        "currentVersion": recipe_row["version"],
+                        "status": status,
+                        "holdLow": recipe_row["hold_low"],
+                        "holdHigh": recipe_row["hold_high"],
+                        "duration": recipe_row["duration"],
+                        "tolerance": recipe_row["tolerance"],
+                        "frozenVersion": json.loads(row["recipe_versions_json"]).get(
+                            str(rid)
+                        ),
+                        "holdMet": outcome["holdMet"],
+                        "firstWindow": outcome["firstWindow"],
+                        "firstToleranceBreachStep": breach,
+                        "reusable": reusable,
+                    }
+                )
+
+            return {
+                "draftId": draft_id,
+                "archivedVersion": row["archived_draft_version"],
+                "temperatures": temperatures,
+                "stepCount": len(temperatures),
+                "items": items,
+                "reusable": all(item["reusable"] for item in items),
+            }

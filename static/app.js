@@ -988,8 +988,9 @@ async function openDraft(id, banner) {
 
   const card = draftDetailCard;
   card.hidden = false;
-  // 切换炉次 / 刷新详情：立即清除旧试算（含旧在途响应的回填资格）
+  // 切换炉次 / 刷新详情：立即清除旧试算与旧复用结论（含旧在途响应的回填资格）
   hideTrial();
+  hideReuse();
   const titleEl = document.getElementById("draft-detail-title");
   titleEl.textContent = `炉次 #${id} 详情加载中…`;
   draftMeta.innerHTML = "";
@@ -1088,6 +1089,10 @@ function renderDraftDetail(d, banner) {
   // 只有已归档（必有冻结曲线）才开放电费试算；试算只读归档，不影响方案
   if (d.status === "archived") setupTrial(d);
   else hideTrial();
+
+  // 同样仅已归档炉次开放原曲线复用检查（只读，不重新求解）
+  if (d.status === "archived") setupReuse(d);
+  else hideReuse();
 
   loadDrafts();
 }
@@ -1426,6 +1431,176 @@ elecForm.addEventListener("submit", async (ev) => {
     return;
   }
   renderElectricity(r.data);
+});
+
+// ============================================================
+// 已归档炉次原曲线复用检查（只读冻结曲线 + 当前配方参数；不重新求解）
+// ============================================================
+const reuseCard = document.getElementById("draft-reuse-card");
+const reuseError = document.getElementById("reuse-error");
+const reuseResult = document.getElementById("reuse-result");
+const reuseSubmitBtn = document.getElementById("reuse-check-btn");
+
+// reuseSeq：复用检查代际。切换炉次 / 刷新详情 / 再次发起检查都会 +1；
+// 只有当前最新一代自身的响应 / HTTP 错误 / 网络异常允许回填结论。
+// 旧代际的回包（哪怕切走后又回到同一炉次才到达）一律丢弃。
+let reuseSeq = 0;
+let reuseLoading = false;
+let reuseDraft = null; // 当前检查所绑定的已归档炉次
+
+function resetReuseButton() {
+  // 按钮只表达“当前这一代”：旧请求的回包按代际作废，不再动按钮。
+  reuseLoading = false;
+  reuseSubmitBtn.disabled = false;
+  reuseSubmitBtn.textContent = "检查原曲线能否复用";
+}
+
+function clearReuseOutput() {
+  // 只清结论区与错误条（切换 / 刷新 / 重新发起时立即移除旧结论）
+  reuseResult.innerHTML = "";
+  reuseError.hidden = true;
+}
+
+function hideReuse() {
+  // 切换炉次 / 刷新详情 / 非已归档炉次：立即清除旧结论（含旧在途响应的
+  // 回填资格）并隐藏卡片
+  reuseSeq += 1;
+  reuseDraft = null;
+  clearReuseOutput();
+  reuseLoading = false;
+  reuseSubmitBtn.disabled = false;
+  reuseSubmitBtn.textContent = "检查原曲线能否复用";
+  reuseCard.hidden = true;
+}
+
+function setupReuse(d) {
+  // 仅已归档炉次可检查：重置代际并清除上一炉次的结论
+  hideReuse();
+  reuseDraft = d;
+  reuseCard.hidden = false;
+}
+
+function windowText(item) {
+  const w = item.firstWindow;
+  if (!w) return "未在原曲线上达标（无连续保温区间）";
+  const minutes = (w.endStep - w.startStep + 1) * 5;
+  return `第 ${w.startStep}～${w.endStep} 档（连续 ${minutes} 分钟）`;
+}
+
+function renderReuseCheck(data) {
+  reuseResult.innerHTML = "";
+
+  const verdict = el("section", {
+    class: "card " + (data.reusable ? "reuse-ok" : "reuse-fail"),
+  });
+  verdict.appendChild(
+    el("h2", {},
+      el("span", {
+        class: "badge " + (data.reusable ? "badge-ok" : "badge-fail"),
+        textContent: data.reusable ? "原曲线可复用" : "原曲线不可复用",
+      }))
+  );
+  verdict.appendChild(el("p", {
+    textContent: data.reusable
+      ? `归档版本 v${data.archivedVersion} 的原曲线（${data.stepCount} 档 / ${data.stepCount * 5} 分钟）满足全部引用配方的当前参数与状态，可直接沿用，无需重新求解。`
+      : "至少一项不满足：原曲线不能直接用于当前配方（详见逐项结论）。",
+  }));
+  reuseResult.appendChild(verdict);
+
+  const listCard = el("section", { class: "card" },
+    el("h2", { textContent: "逐项结论（按原配方引用顺序）" }));
+  const tableWrap = el("div", { class: "table-wrap" });
+  const table = el("table");
+  table.appendChild(el("thead", {}, el("tr", {},
+    el("th", { textContent: "顺序" }),
+    el("th", { textContent: "配方" }),
+    el("th", { textContent: "当前版本" }),
+    el("th", { textContent: "当前状态" }),
+    el("th", { textContent: "归档时版本" }),
+    el("th", { textContent: "当前保温要求 / 耐受上限" }),
+    el("th", { textContent: "保温是否达标" }),
+    el("th", { textContent: "首次达标连续档位区间" }),
+    el("th", { textContent: "首次超过耐受上限档号" }),
+    el("th", { textContent: "该项结论" }))));
+  const tbody = el("tbody");
+  data.items.forEach((item, i) => {
+    const disabled = item.status === "disabled";
+    const tr = el("tr", { class: item.reusable ? "" : "row-fail" });
+    tr.appendChild(el("td", { textContent: String(i + 1) }));
+    tr.appendChild(el("td", { textContent: `#${item.recipeId} ${item.name || "（未命名）"}` }));
+    tr.appendChild(el("td", {}, el("span", { class: "ver-badge", textContent: `v${item.currentVersion}` })));
+    tr.appendChild(el("td", {}, el("span", {
+      class: "status-badge " + (disabled ? "status-disabled" : "status-active"),
+      textContent: disabled ? "已停用" : "可用",
+    })));
+    tr.appendChild(el("td", { textContent: item.frozenVersion != null ? `v${item.frozenVersion}` : "—" }));
+    tr.appendChild(el("td", {
+      textContent: `${item.holdLow}–${item.holdHigh}°C 连续 ${item.duration} 分钟；耐受 ${item.tolerance}°C`,
+    }));
+    tr.appendChild(el("td", {
+      textContent: item.holdMet ? "达标" : "未达标",
+      class: item.holdMet ? "text-ok" : "text-fail",
+    }));
+    tr.appendChild(el("td", { textContent: windowText(item) }));
+    tr.appendChild(el("td", {
+      textContent: item.firstToleranceBreachStep == null
+        ? "无"
+        : `第 ${item.firstToleranceBreachStep} 档`,
+      class: item.firstToleranceBreachStep == null ? "" : "text-fail",
+    }));
+    tr.appendChild(el("td", {}, el("span", {
+      class: "badge " + (item.reusable ? "badge-ok" : "badge-fail"),
+      textContent: item.reusable
+        ? "可复用"
+        : [
+            disabled ? "配方已停用" : null,
+            item.holdMet ? null : "保温未达标",
+            item.firstToleranceBreachStep == null ? null : "存在超限档位",
+          ].filter(Boolean).join("；"),
+    })));
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  tableWrap.appendChild(table);
+  listCard.appendChild(tableWrap);
+  listCard.appendChild(el("p", { class: "hint", textContent:
+    "区间与档号均从 1 计，每档 5 分钟；无对应项显示为「— / 无 / 未达标」。"
+    + "停用项同样完成全曲线温度检查，但停用状态下该项不可复用。" }));
+  reuseResult.appendChild(listCard);
+}
+
+reuseSubmitBtn.addEventListener("click", async () => {
+  // 只有“当前已归档详情成功加载后”才可检查：加载中 / 读取失败 / 未归档时
+  // reuseDraft 均为 null（卡片本身也隐藏）
+  if (!reuseDraft || reuseDraft.status !== "archived") return;
+  if (reuseLoading) return; // 当前这一代自身响应未回来前，忽略重复点击
+
+  clearReuseOutput();
+  const seq = ++reuseSeq;
+  reuseLoading = true;
+  reuseSubmitBtn.disabled = true;
+  reuseSubmitBtn.textContent = "检查中…";
+
+  let r;
+  try {
+    r = await api(`/api/drafts/${reuseDraft.id}/reuse-check`);
+  } catch (e) {
+    // 网络异常只认当前代际：切换 / 刷新 / 新检查之后的异常不得回填
+    if (seq !== reuseSeq) return;
+    resetReuseButton();
+    reuseError.textContent = "复用检查请求失败（网络异常），未改变任何数据，可重试。";
+    reuseError.hidden = false;
+    return;
+  }
+  // 迟到响应（切换炉次 / 刷新详情 / 更新的检查之后到达）一律作废
+  if (seq !== reuseSeq) return;
+  resetReuseButton();
+  if (!r.ok) {
+    reuseError.textContent = detailOf(r.data);
+    reuseError.hidden = false;
+    return;
+  }
+  renderReuseCheck(r.data);
 });
 
 // ---------- 启动 ----------

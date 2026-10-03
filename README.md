@@ -10,10 +10,11 @@
 
 - 后端：Python + FastAPI（求解核心见 `app/solver.py`，纯标准库 BFS；
   配方 / 炉次 / 归档用 SQLite 持久化，见 `app/db.py`、`app/store.py`；
-  已归档炉次只读电费试算见 `app/electricity.py`）
+  已归档炉次只读电费试算见 `app/electricity.py`；已归档炉次原曲线复用
+  检查见 `GET /api/drafts/{id}/reuse-check`）
 - 前端：原生 HTML / CSS / JavaScript（`static/`，无任何前端构建与框架，
   页面分为「编排求解 / 材料配方 / 炉次草稿」三个标签页；已归档炉次详情中
-  含电费试算卡片）
+  含电费试算与原曲线复用检查卡片）
 
 ## 一条命令启动
 
@@ -230,6 +231,7 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | GET | `/api/drafts/{id}` | 读取炉次详情（归档后返回冻结快照） |
 | POST | `/api/drafts/{id}/archive` | 携带查看版本归档（过期 409 / 无解 422） |
 | POST | `/api/drafts/{id}/electricity` | 已归档炉次电费试算（只读冻结曲线，不保存；未知 404 / 未归档或参数非法 422） |
+| GET | `/api/drafts/{id}/reuse-check` | 原曲线复用检查：用归档冻结曲线逐项核对当前配方（不重新求解，只读；未知 404 / 未归档 422） |
 
 ### 从零编排（可直接复制执行）
 
@@ -597,6 +599,121 @@ curl -sS -X POST http://localhost:8000/api/drafts/1/electricity \
 - **当前请求完成后恢复操作**：成功展示逐档试算结果；HTTP 错误（404/422
   等）在错误条显示后端中文原因；网络失败不改动数据并可直接重试——恢复与否
   只取决于当前这一代自身是否结束，**不受旧请求是否已经结束影响**。
+
+### 已归档炉次原曲线复用检查 `GET /api/drafts/{id}/reuse-check`
+
+检查已归档炉次**归档冻结的原曲线**能否直接用于各配方的**当前参数与状态**，
+**不重新求解**、不修改配方 / 草稿 / 归档：
+
+- 按**原配方引用顺序**，在**同一读取时点**（同一只读快照事务）读取各配方
+  当前的参数、`version` 与 `status`；
+- 每档 5 分钟，连续保温沿用原规则：档位落在当前 `[holdLow, holdHigh]`
+  内连续累计所需档数（5/10/15 分钟 = 1/2/3 档），离开区间则未达标进度
+  归零；记录每种材料**首次达标**的连续档位区间；
+- **达标后仍扫描全曲线**，逐档检查当前耐受上限，记录**首个**严格超过
+  耐受上限的档号；
+- **停用的配方同样完成全部温度检查**（保温是否达标、有无超限档），只是
+  `status=disabled` 会使该项不可复用；
+- 区间与档号均**从 1 计**；从未达标 / 从未超限时对应字段为 `null`；
+- 仅当**全部材料保温达标、全曲线无超限且配方均为 `active`** 时，整体
+  `reusable` 才为 `true`。
+
+状态码：炉次 ID 未知 → **404**；炉次存在但未归档（活动 / 无解草稿）→
+**422**。
+
+可直接复制执行（沿用前面创建并归档的炉次 1，冻结曲线
+`[40,60,80,60,40,20]`）：
+
+```bash
+curl -sS http://localhost:8000/api/drafts/1/reuse-check
+```
+
+返回（HTTP 200；原配方参数未变，整体可复用）：
+
+```json
+{
+  "draftId": 1,
+  "archivedVersion": 1,
+  "temperatures": [40, 60, 80, 60, 40, 20],
+  "stepCount": 6,
+  "items": [
+    {
+      "recipeId": 1,
+      "name": "钢甲",
+      "currentVersion": 1,
+      "status": "active",
+      "holdLow": 60, "holdHigh": 100, "duration": 10, "tolerance": 150,
+      "frozenVersion": 1,
+      "holdMet": true,
+      "firstWindow": {"startStep": 2, "endStep": 3},
+      "firstToleranceBreachStep": null,
+      "reusable": true
+    },
+    {
+      "recipeId": 2,
+      "name": "铜乙",
+      "currentVersion": 1,
+      "status": "active",
+      "holdLow": 80, "holdHigh": 120, "duration": 5, "tolerance": 160,
+      "frozenVersion": 1,
+      "holdMet": true,
+      "firstWindow": {"startStep": 3, "endStep": 3},
+      "firstToleranceBreachStep": null,
+      "reusable": true
+    }
+  ],
+  "reusable": true
+}
+```
+
+字段含义：
+
+| 字段 | 含义 |
+| --- | --- |
+| `archivedVersion` | 归档冻结的草稿版本（检查不会改变它） |
+| `items[]` | 按**原配方引用顺序**给出的逐项结论 |
+| `items[].currentVersion` / `status` | 配方当前版本与状态（`active` / `disabled`） |
+| `items[].frozenVersion` | 归档时引用的配方版本（用于对照版本是否已变） |
+| `items[].holdMet` | 原曲线是否使该配方的当前保温要求**首次连续达标** |
+| `items[].firstWindow` | 首次达标的连续档位区间（1-based）；未达标为 `null` |
+| `items[].firstToleranceBreachStep` | 首个超过当前耐受上限的档号（1-based）；无超限为 `null` |
+| `items[].reusable` | 该项是否可复用（`active` 且保温达标且无超限） |
+| `reusable` | **全部**项可复用才为 `true` |
+
+不可复用的两种典型情形：
+
+```bash
+# 配方 1 改成保温下限 90°C：原曲线无档落在 90～100°C -> holdMet=false
+curl -sS -X PUT http://localhost:8000/api/recipes/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"钢甲","holdLow":90,"holdHigh":100,"duration":10,"tolerance":150}'
+
+# 配方 2 停用：温度检查照常完成，但 status=disabled 使其不可复用
+curl -sS -X POST http://localhost:8000/api/recipes/2/disable
+
+curl -sS http://localhost:8000/api/drafts/1/reuse-check
+# 节选：
+# "items":[
+#   {"recipeId":1,"currentVersion":2,"status":"active","holdMet":false,
+#    "firstWindow":null,"firstToleranceBreachStep":null,"reusable":false},
+#   {"recipeId":2,"currentVersion":1,"status":"disabled","holdMet":true,
+#    "firstWindow":{"startStep":3,"endStep":3},
+#    "firstToleranceBreachStep":null,"reusable":false}
+# ],
+# "reusable":false
+```
+
+```bash
+# 未知炉次 -> 404；未归档炉次 -> 422
+curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:8000/api/drafts/999/reuse-check
+# 404
+```
+
+前端在「炉次草稿」详情中，仅**已归档**炉次显示「原曲线复用检查」卡片：
+点击后逐项展示配方 ID、当前版本与状态、保温是否达标、首次达标连续档位
+区间、首次超过耐受上限的档号，以及整体可否复用。**切换炉次或刷新详情
+会立即清除既有结论**；检查请求自带代际，此前请求的迟到成功 / HTTP 错误
+回包与网络异常一律作废，不会回填到当前界面。
 
 ## 目录结构
 

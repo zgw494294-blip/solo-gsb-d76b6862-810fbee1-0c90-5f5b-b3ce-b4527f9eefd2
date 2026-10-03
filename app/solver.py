@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 STEP_MINUTES = 5          # 每档 5 分钟
 INIT_TEMP = 20            # 炉温初态
@@ -259,6 +260,47 @@ def _first_windows(seq: list[int], materials: list[Material]) -> list[dict]:
             }
         )
     return windows
+
+
+def evaluate_curve(
+    seq: list[int], materials: list[Material]
+) -> list[dict[str, Any]]:
+    """用一条**既有**曲线逐项核对材料的当前参数，不重新求解。
+
+    保温判定沿用原规则：档位落在 [下限, 上限] 内连续累计 need_steps 档
+    （离开区间则未达标进度归零），记录每种材料**首次达标**的连续档位区间；
+    全曲线（含达标之后的档位）逐档检查该材料的耐受上限，记录**首个**
+    严格超过耐受上限的档号。区间与档号均为 1-based；从未达标 / 从未超限
+    时对应项为 None。
+    """
+    outcomes: list[dict[str, Any]] = []
+    for m in materials:
+        run = 0
+        window: tuple[int, int] | None = None
+        breach: int | None = None
+        for idx, t in enumerate(seq, start=1):
+            # 达标后仍扫描全曲线的耐受上限
+            if breach is None and t > m.tolerance:
+                breach = idx
+            if window is None:
+                if m.hold_low <= t <= m.hold_high:
+                    run += 1
+                    if run >= m.need_steps:
+                        window = (idx - m.need_steps + 1, idx)
+                else:
+                    run = 0
+        outcomes.append(
+            {
+                "holdMet": window is not None,
+                "firstWindow": (
+                    {"startStep": window[0], "endStep": window[1]}
+                    if window is not None
+                    else None
+                ),
+                "firstToleranceBreachStep": breach,
+            }
+        )
+    return outcomes
 
 
 def _build_result(

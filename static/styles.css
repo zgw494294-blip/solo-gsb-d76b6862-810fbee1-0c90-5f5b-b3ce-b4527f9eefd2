@@ -474,3 +474,14 @@ tr.row-disabled td { color: #8a97a5; background: #fafbfc; }
   .elec-price-grid { grid-template-columns: repeat(4, 1fr); }
   .elec-power-grid { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* ---------- 原曲线复用检查 ---------- */
+#draft-reuse-card .badge { vertical-align: middle; }
+.reuse-ok { border-color: #bfe3cd; background: #f5fbf7; }
+.reuse-fail { border-color: #f5c6c2; background: #fdf7f6; }
+.reuse-ok h2, .reuse-fail h2 { display: flex; align-items: center; gap: 10px; }
+.reuse-ok p, .reuse-fail p { margin: 0; font-size: 14.5px; }
+.text-ok { color: var(--ok); }
+tr.row-fail td { background: #fdf3f2; }
+#reuse-result { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
+#reuse-result:empty { margin-top: 0; }
